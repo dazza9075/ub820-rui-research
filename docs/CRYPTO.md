@@ -32,3 +32,24 @@ Try each captured key against each file; the one that yields clean JS is the mat
   (password-derived, CBC) with constant passphrases. Different code path, not the module key.
 - The DRM keys (PlayReady/Widevine/AACS) live in the TrustZone secure world and are **not**
   reachable from normal-world root. Out of scope.
+
+## Static key derivation (alternative to runtime capture)
+
+The per-`.js` key does **not** have to be captured at runtime — it is a deterministic function of the
+**filename**, computable offline from the engine binary alone (verified against runtime-captured keys):
+
+```
+basename = filename after the last '/'
+index    = ( XOR of the five big-endian 32-bit words of SHA1(basename) ) % 9
+key      = KEY_TABLE[index]     # 16 bytes; AES-128-CBC, IV=0 (+ CFB tail, see above)
+```
+
+`KEY_TABLE` is 9 × 16 bytes of `.rodata` in the engine binary (`AjaxCeplay`), located via the three
+functions that implement this: one does `strrchr(path,'/')` → basename, calls the SHA1 helper, and
+indexes the table; another feeds the result to an `EVP_*` AES decrypt with a zero IV. (Extract the table
+from **your own** device's binary — it is key material and is not included here.) One table slot is a
+non-key dud, so a filename that hashes to it won't decrypt.
+
+Practical upshot: on hardware you own you can recover the whole key set from the binary without any
+runtime hooking, and — because the key depends only on the name — you can encrypt a **new** `.js` such
+that the stock engine will decrypt it (compute its index from its filename, encrypt with that key).
