@@ -32,7 +32,7 @@ protected — and how to recover **your own** UI source on **your own** device.
 - `ghidra_scripts/` — headless decompile scripts used to locate the crypto (`CipherKey`, `setKey`).
 - `firmware-recipes/` — the shell additions we inject (telnet supervisor + startrc hook). The
   region-free patches, busybox binary, and repack tool come from upstream — see below.
-- `docs/` — METHOD.md (full walkthrough), CRYPTO.md (the RUI scheme), HARDENING.md (recoverable custom-fw platform + safe live-edit loop + admin backend).
+- `docs/` — METHOD.md (full walkthrough), CRYPTO.md (the RUI scheme), HARDENING.md (recoverable platform + live-edit loop + admin backend), UI-ARCHITECTURE.md (view-based UI + on-screen overlay findings).
 
 ## Reproduce on your own device
 1. Get the repack toolchain: **WeebDataHoarder/pana-fw** (has the A8640EU firmware AES key +
