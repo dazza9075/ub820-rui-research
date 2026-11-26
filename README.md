@@ -23,6 +23,22 @@ protected — and how to recover **your own** UI source on **your own** device.
   decrypt each `.js` on load → an `LD_PRELOAD` shim hooking OpenSSL `EVP_DecryptInit` logs the keys.
   Navigate the menus and you capture the key stream; decrypt your UI source offline.
 
+## Native code & display control (2026-11)
+With a root shell, you can run your **own compiled `armhf` code** on the player and drive the closed
+vendor AV/graphics stack:
+- **Call the closed vendor libraries** from your own binary (`dlopen`/`dlsym` + signatures cribbed from
+  the stock AV binaries). Confirmed: HDMI/AV getters (read the connected sink's audio/EDID caps).
+- **Write pixels to the 4K OSD plane** directly (`/dev/exmem`), and **read it back** for pixel-exact
+  screenshots of the live UI / menus / playback overlays — the compositor's client path is off-screen,
+  so direct plane VRAM access is the way.
+- **Video pipeline mapped** (Hantro G2 → DTRC refs → VPE → VOC → HDMI). Decoded frames (incl. AACS) sit
+  in normal readable RAM (`optee=0`) — reading others' frames is blocked only by **proprietary formats**
+  (Hantro RFC "DTRC" compression + a non-standard VOC output tiling), not by access.
+
+→ Full write-up, structures and how-to: **[`docs/NATIVE-ACCESS.md`](docs/NATIVE-ACCESS.md)**.
+Open question on the decoded-frame format: **[`docs/decoded-frame-format-open-question.md`](docs/decoded-frame-format-open-question.md)**.
+Example tooling (no keys/binaries): **[`examples/native/`](examples/native/)**.
+
 ## Repo layout
 - `src/libjshook.c` — LD_PRELOAD interposer: logs AES key/iv/passphrase when `AjaxCeplay` decrypts
   (comm-gated, raw-syscall I/O, fail-safe). `*_memcpy_variant.c` also hooks the `setKey` memcpy.
