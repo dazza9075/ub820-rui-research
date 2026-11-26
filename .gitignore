@@ -6,3 +6,6 @@ decrypted*/
 *keys*.txt
 *jshook*.log
 PANAEUSB*
+
+# session worktrees / local
+.claude/

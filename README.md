@@ -52,3 +52,5 @@ protected — and how to recover **your own** UI source on **your own** device.
 ## License
 Original code here is MIT (see LICENSE). Panasonic trademarks/firmware are not included and remain
 Panasonic's property.
+
+- [docs/NETWORK-SERVICES.md](docs/NETWORK-SERVICES.md) — custom Network Services page + app launch + toggle.
