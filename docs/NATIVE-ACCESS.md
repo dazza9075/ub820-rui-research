@@ -98,7 +98,11 @@ binary whose own debug tag shows it is a non‑disruptive capability probe, so r
 (Mis‑signatured calls can crash the HDMI server, but the platform watchdog restarts it and the unit
 self‑heals.)
 
-## 5. Free‑plane overlay — the current open engineering item
+## 5. Free‑plane overlay — SOLVED, see OVERLAY-AND-CLOCK.md
+
+> **Update 2026-11-27:** solved. Plane 7 is the live UI plane and `Set_Addr` takes bus addresses
+> (phys − 0xC0000000). Working overlay + persistent clock: [OVERLAY-AND-CLOCK.md](OVERLAY-AND-CLOCK.md).
+
 
 Goal: a **persistent** overlay that composites over the live UI without fighting the UI's repaints — by
 using a **free** OSD plane (LOSD0) instead of the UI's plane.

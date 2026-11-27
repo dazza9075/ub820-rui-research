@@ -35,6 +35,7 @@ int main(void){
     }
     if(get_osd){ for(int i=0;i<3;i++){ unsigned p=get_osd(i,0); unsigned p1=get_osd(i,1);
         w("[pp] get_osd idx="); wi(i); w(" sub0="); whx(p); w(" sub1="); whx(p1); w("\n"); } }
+    { int(*Cl)(void)=a?(int(*)(void))dlsym(a,"AVIO_UP_Close"):0; if(Cl&&AVIO_UP_Open){ int r=Cl(); w("[pp] AVIO_UP_Close()="); wi(r); w("\n"); } }
     w("[pp] done (read-only, no plane touched)\n");
     return 0;
 }
