@@ -188,6 +188,49 @@ stop_keys(){ [ -n "$KEYPID" ] || return 0; kill "$KEYPID" 2>/dev/null; wait "$KE
 cleanup(){ stop_keys; stop_subs; stop_extract; [ "${USE_LL:-0}" = 1 ] && $BB umount /usr/local/bin/vcavsrv 2>/dev/null; }   # ub820keys: +stop_keys
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
+# ---- native-player recovery BEGIN (findings/native-player-recovery.md) ----
+# Panasonic's own media player (apl_medm -> fmpsrv + apl_meda_plynv + flcsrv) holds the decoder (/dev/dtv/tdav*0, rtsc
+# ch/buf ports, AVD ch0) while its USB file list is up, even after STOP. Starting us then makes vcavsrv fail
+# (vcav_tdav_open_av EBUSY, vcr_open_port, AVD_ERR_STATE, unmute probe), crash in teardown and leave /tmp/vcavsrv.alive:
+# every later run then says "vcavsrv not reachable" (the next vcavsrv waits on that lock forever). Our homerestore also
+# paints the home over the still-running media app, so it looks like Home but the decoder stays taken.
+# Recovery, no reboot: (1) media app alive -> inject the HOME key into apl_mgr (keyinj 0x57 = the IR remote's HOME
+# through AM's LAN-key path); AM closes the media app the stock way (AVD_Close, flcsrv term, home). (2) clear a stale
+# /tmp/vcavsrv.alive (no multi-threaded vcavsrv alive); release + wait out any run stuck on it. Acts only when needed;
+# skipped while ub820play runs. UB820_RECOVER=0 turns it off.
+native_holders(){   # pids holding the TDAV / rtsc stream ports (vcavsrv excluded) + a running fmpsrv
+  { $BB ls -l /proc/[0-9]*/fd 2>/dev/null | $BB awk '/^\/proc\/[0-9]+\/fd:$/{split($0,a,"/"); p=a[3]; next}
+      / -> \/dev\/dtv\/tdav(video|audio)0$| -> \/dev\/dtvrec\/rtsc\/ch[0-9]+$/{print p}'; $BB pidof fmpsrv; } |
+    $BB tr ' ' '\n' | $BB sort -u | while read -r p; do
+      [ -n "$p" ] && [ -d /proc/$p ] && [ "$($BB cat /proc/$p/comm 2>/dev/null)" != vcavsrv ] && echo "$p"; done; }
+vcav_servers(){ for p in $($BB pidof vcavsrv); do   # a real server has many threads, a lock waiter has 1 (unknown = server)
+  T=$($BB awk '/^Threads:/{print $2}' /proc/$p/status 2>/dev/null); [ "${T:-2}" -gt 1 ] 2>/dev/null && echo "$p"; done; }
+other_runs(){ for p in $($BB pgrep -f ub820run.sh); do [ "$p" = $$ ] && continue
+  [ "$($BB awk '/^PPid:/{print $2}' /proc/$p/status 2>/dev/null)" = $$ ] || echo "$p"; done; }
+if [ "${UB820_RECOVER:-1}" != 0 ] && ! $BB pidof ub820play >/dev/null; then
+  NH=$(native_holders | $BB tr '\n' ' ')
+  if [ -n "$NH" ]; then
+    echo "ub820run: recovery: Panasonic media player holds the decoder (pids $NH): sending HOME to close it" >&2
+    if [ -x $BIN/keyinj ]; then $BIN/keyinj 0x57 >&2; else echo "ub820run: recovery: $BIN/keyinj missing" >&2; fi
+    i=0; while [ $i -lt 40 ] && [ -n "$(native_holders)" ]; do $BB sleep 0.5; i=$((i+1)); done
+    NH=$(native_holders | $BB tr '\n' ' ')
+    if [ -n "$NH" ]; then echo "ub820run: ERROR: recovery: decoder still held by pids $NH after 20 s; not starting" \
+      "(leave the Panasonic player with HOME, then retry)" >&2; exit 20; fi
+    echo "ub820run: recovery: media player closed after ~$((i/2)) s" >&2; $BB sleep 2   # AM finishes its home transition
+  fi
+  if [ -e /tmp/vcavsrv.alive ]; then
+    # a vcavsrv finishing a normal teardown removes the lock itself: give it 5 s before judging the lock stale
+    i=0; while [ $i -lt 10 ] && [ -e /tmp/vcavsrv.alive ] && $BB pidof vcavsrv >/dev/null; do $BB sleep 0.5; i=$((i+1)); done
+    if [ -e /tmp/vcavsrv.alive ] && [ -z "$(vcav_servers)" ]; then
+      echo "ub820run: recovery: removing stale /tmp/vcavsrv.alive (vcavsrv lock waiters: $($BB pidof vcavsrv))" >&2
+      OR=$(other_runs); [ -n "$OR" ] && : > /tmp/ub820run.nohome   # a run stuck on the lock: no home restore when it unwinds
+      $BB rm -f /tmp/vcavsrv.alive
+      i=0; while [ $i -lt 20 ] && { $BB pidof vcavsrv >/dev/null || [ -n "$(other_runs)" ]; }; do $BB sleep 0.5; i=$((i+1)); done
+      [ -n "$(other_runs)" ] && echo "ub820run: recovery: an earlier ub820run.sh is still running ($(other_runs))" >&2
+    elif [ -e /tmp/vcavsrv.alive ]; then echo "ub820run: recovery: a vcavsrv is still running ($(vcav_servers)); left alone" >&2; fi
+  fi
+fi
+# ---- native-player recovery END ----
 # one overlay at a time: stop leftovers from an earlier run (SIGTERM; they clear LOSD0 on the way out)
 if [ -n "$SUBFILE" ] && $BB pidof subovl >/dev/null; then $BB killall subovl 2>/dev/null
   for i in 1 2 3; do $BB pidof subovl >/dev/null || break; $BB sleep 1; done; fi

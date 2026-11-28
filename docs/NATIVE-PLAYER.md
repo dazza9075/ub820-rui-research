@@ -56,6 +56,7 @@ mocserver (its AVIOLIB code) decides bitstream vs PCM and the channel count per 
 | `ub820run.sh` | launcher: probe with ffmpeg; copy or transcode video (MPEG-2 for codecs the HW can't do) and audio (AC-3 for DTS/TrueHD/...); all audio tracks on separate PIDs; subtitles; session renewal; home restore |
 | `media.cgi` | LAN web remote (busybox httpd): library, now-playing with live position, pause/seek/stop, audio-track switch |
 | `ub820keys.c` | remote-control keys during playback via a perf hardware breakpoint in apl_mgr's key router |
+| `keyinj.c` | inject a remote key into apl_mgr (used to close Panasonic's own player before ours starts) |
 | `runlow.c` | run a command with CPU affinity / SCHED_IDLE / nice (used to pin the streaming ffmpeg) |
 | `mocaprobe.c` | read-only libmoc probe of HDMI/audio monitor attributes |
 | `subovl.c` | text-subtitle overlay: SRT/WebVTT drawn with stb_truetype into a free OSD buffer (LOSD0), timed from the player status |
