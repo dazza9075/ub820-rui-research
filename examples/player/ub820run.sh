@@ -7,17 +7,17 @@
 #             with the static ffmpeg (cached per file+track); bitmap codecs (PGS, DVD, DVB) are not supported yet.
 #     auto    a sidecar <file>.srt / .vtt next to the media if present, else the first text subtitle stream
 #     PATH    an external .srt / .vtt file
-#   Subtitles are drawn in HD mode only (4K: plane 7 state untested; UB820_SUBS_4K=1 to try anyway).
+#   Subtitles are drawn on the 4K route too (default since 2026-11-28; UB820_SUBS_4K=0 turns them off there).
 #   UB820_SUBOPT = extra subovl options, e.g. "--size 60 --offset -0.4". subovl logs to /tmp/subovl.log.
 #   Probes with the static ffmpeg, then pipes a 188-byte MPEG-TS into ub820play:
 #     video: MPEG-1/2, H.264, HEVC, VC-1 -> copied (hardware decode); anything else -> software-decoded and
 #            re-encoded to MPEG-2 on the fly (fine for SD, ~real time at 720p).
 #     audio: AAC / AC-3 / E-AC-3 / MP2 / MP3 -> copied; DTS, DTS-HD, TrueHD, FLAC, Vorbis, Opus, PCM ... -> AC-3 5.1 640k
 #            (vcavsrv's codec table cannot select DTS/TrueHD; see findings/vcav-audio.md).
-#     routing: > 1920x1088 -> --4k (4KOTT use case, home UI is torn down), else --hd (home survives; the OSD
-#              is cleared to transparent so the video is visible full screen).
+#     routing: --4k (4KOTT use case, home UI torn down, homerestore after) for every file; UB820_ROUTE=hd = DIVX route.
 # Env: UB820_BIN (dir with ffmpeg/ub820play, default /tmp), UB820_DRY=1 (print the pipeline only).
 BB=/bin/busybox; BIN=${UB820_BIN:-/tmp}; FF=$BIN/ffmpeg; PL=$BIN/ub820play
+FFX=$FF; [ -n "${UB820_NICE:-}" ] && FFX="$BB nice -n $UB820_NICE $FF"   # the streaming ffmpeg(s)
 export LD_LIBRARY_PATH=/usr_root/lib:/lib:/usr/lib:/usr/X11R6/lib:/usr/dtvrec/lib:/usr/local/lib
 F="$1"; AT="${2:-0}"; SS="${3:-}"; ST="${4:-none}"; STARG="$ST"
 [ -r "$F" ] || { echo "usage: $0 <file> [audio_track|none] [start_s] [sub_track|none|auto|file.srt]" >&2; exit 1; }
@@ -44,18 +44,21 @@ RAWIN=""; if echo "$INFO" | $BB grep -qE '^Input #0, (hevc|h264|mpegvideo|mjpeg|
   case "$FR" in */*) TSX="N*${FR#*/}/${FR%/*}/TB";; *) TSX="N/$FR/TB";; esac
   RAWIN="-framerate $FR"; [ "$VOPT" = "-c:v copy" ] && VOPT="-c:v copy -bsf:v setts=ts=$TSX"; fi
 # VP9: hardware path rejects PLAY via raw TS (both use cases) -> software decode + MPEG-2 transcode (default branch)
-MODE=--hd; [ "${W:-0}" -gt 1920 ] || [ "${H:-0}" -gt 1088 ] && MODE=--4k
+# Routing: the 4KOTT use case for everything (2026-11-28: on the DIVX/HD route the home UI kept redrawing over the
+# video, sound only; 1080p H.264 and 720p MPEG-2 play fine on 4KOTT). UB820_ROUTE=hd brings the old DIVX route back.
+MODE=--4k; [ "${UB820_ROUTE:-}" = hd ] && MODE=--hd
 # audio: map ALL audio tracks (max 4) so they can be switched live (ub820play ctl "audio <pid> <codec>");
 # each goes on PID 0x1100+i, copied when vcavsrv can take it, else transcoded to AC-3. The start track is $AT.
-AOPT="-an"; APL="--apid none"; AN=$(echo "$INFO" | $BB grep -c 'Stream #.*Audio:'); : > /tmp/ub820run.tracks
+AOPT="-an"; APL="--apid none"; DECOPT=""; AN=$(echo "$INFO" | $BB grep -c 'Stream #.*Audio:'); : > /tmp/ub820run.tracks
 [ "$AN" -gt 4 ] && AN=4
+[ -n "${UB820_MAXA:-}" ] && [ "$AN" -gt "$UB820_MAXA" ] && AN=$UB820_MAXA   # test knob: fewer audio tracks
 if [ "$AT" != none ] && [ "$AN" -gt 0 ]; then
   [ "$AT" -ge "$AN" ] && AT=0
   AOPT=""; i=0
   while [ $i -lt $AN ]; do
     AL=$(echo "$INFO" | $BB grep 'Stream #.*Audio:' | $BB sed -n "$((i+1))p")
     C=$(echo "$AL" | $BB sed -n 's/.*Audio: \([a-z0-9_]*\).*/\1/p')
-    LL=0; [ -f /tmp/ub820.lossless ] && [ -x $BIN/vcavsrv.lossless ] && LL=1
+    LL=0; [ -f /tmp/ub820.lossless ] && [ -x ${UB820_LLBIN:-$BIN/vcavsrv.lossless} ] && LL=1
     case "$C" in
       dts)    if [ $LL = 1 ]; then X="copy"                 # patched vcavsrv: vcav 0x20+N -> AVD N
                 # DTS-HD MA decodes as s32p (24 bit) in ffmpeg; core/HRA as fltp. AVD 0x10 = DTS-HD MA, 5 = DTS core.
@@ -71,7 +74,10 @@ if [ "$AT" != none ] && [ "$AN" -gt 0 ]; then
       eac3) K=8; X="copy";;
       mp2|mp3) K=2; X="copy";;
       *)    K=1; CH=6; echo "$AL" | $BB grep -qE ' (mono|stereo|2 channels)' && CH=2
-            X="ac3 -b:a:$i 640k -ar:a:$i 48000 -ac:a:$i $CH";;
+            X="ac3 -b:a:$i 640k -ar:a:$i 48000 -ac:a:$i $CH"
+            # DTS-HD MA/HRA/X: decode only the DTS core for the AC-3 re-encode (the full XLL decode is CPU-heavy
+            # and its bursts made the video stutter every ~5 s, 2026-11-28)
+            [ "$C" = dts ] && [ "${UB820_DTSFULL:-0}" = 0 ] && DECOPT="-core_only 1";;
     esac
     PID=$((4352+i)); AOPT="$AOPT -map 0:a:$i -c:a:$i $X -streamid $((i+1)):$PID"
     LANG=$(echo "$AL" | $BB sed -n 's/.*Stream #0:[0-9]*\(([a-z]*)\)\{0,1\}.*/\1/p')
@@ -80,7 +86,48 @@ if [ "$AT" != none ] && [ "$AN" -gt 0 ]; then
     i=$((i+1))
   done
 fi
+# Lossless mode: the patched vcavsrv must also REPORT the real coding type to mocserver, else mocserver outputs it as
+# 2ch PCM (findings/hd-audio-output.md, P1 @0x66b2). One binary per format, picked by the starting track:
+#   TrueHD -> vcavsrv.ll_thd (CT 6)   DTS-HD MA -> ll_ma (CT 8)   DTS-HD HRA -> ll_hr (CT 7)   DTS core -> ll_core (CT 4)
+# 2026-11-28 console: MA -> IEC output "dts" bitstream (was "pcm 2D"); TrueHD -> "D1|ddg". AVR result: TBC by the user.
+if [ "${USE_LL:-0}" = 1 ] && [ -z "${UB820_LLBIN:-}" ]; then
+  case "$AC:$ACODEC" in truehd:*) LB=ll_thd;; dts:48) LB=ll_ma;; dts:46) LB=ll_hr;; dts:*) LB=ll_core;; *) LB="";; esac
+  [ -n "$LB" ] && [ -x $BIN/vcavsrv.$LB ] && UB820_LLBIN=$BIN/vcavsrv.$LB && echo "ub820run: lossless: $UB820_LLBIN" >&2
+fi
 SSO=""; [ -n "$SS" ] && SSO="-ss $SS"
+# Audio starting well before the first video frame (BHD: audio 0.000 s, video 1.364 s) made the decoder start its
+# clock on the audio and freeze the picture ~1.2 s right after the start (2026-11-28). From the top, start at the
+# first video packet instead. UB820_VSTART=0 turns it off.
+if [ -z "$SS" ] && [ "$AT" != none ] && [ "${AN:-0}" -gt 0 ] && [ "${UB820_VSTART:-1}" != 0 ]; then
+  VS=$($FF -nostdin -debug_ts -i "$F" -map 0:v:0 -map 0:a:$AT -c copy -frames:v 2 -f null - 2>&1 | $BB grep 'demuxer -> ' |
+    $BB awk '/type:video/ && v==""{match($0,/pkt_pts_time:[-0-9.]+/); v=substr($0,RSTART+13,RLENGTH-13)}
+             /type:audio/ && a==""{match($0,/pkt_pts_time:[-0-9.]+/); a=substr($0,RSTART+13,RLENGTH-13)}
+             END{ if(v!="" && a!="" && v-a > 0.25) printf "%.3f", v }')
+  [ -n "$VS" ] && { SSO="-ss $VS"; SS=$VS; echo "ub820run: audio starts before the video: starting at the first video frame (${VS}s)" >&2; }
+fi
+# Matroska keeps 1 ms timestamps (and the demuxer guesses DTS): 23.976p video then reaches the decoder with
+# 41/42 ms jitter, seen as a stutter every few seconds on 4K HEVC (2026-11-28). A second, copy-only ffmpeg on the
+# 90 kHz TS snaps PTS to the frame grid and rebuilds DTS as start + N frames. UB820_SNAP=0 turns it off.
+SNAP=""; if echo "$INFO" | $BB grep -q '^Input #0, matroska' && [ "$VOPT" = "-c:v copy" ] && [ "${UB820_SNAP:-1}" != 0 ]; then
+  case "$FPS" in 23.98|23.976) FS=1001/24000;; 24) FS=1/24;; 25) FS=1/25;; 29.97) FS=1001/30000;; 30) FS=1/30;;
+                 50) FS=1/50;; 59.94) FS=1001/60000;; 60) FS=1/60;; *) FS="";; esac
+  if [ -z "$FS" ]; then   # no usable frame rate in the header (e.g. "1k fps, 120 tbr"): measure 150 packets' PTS
+    FS=$($FF -nostdin -debug_ts -i "$F" -map 0:v:0 -c copy -frames:v 150 -f null - 2>&1 | $BB grep 'demuxer -> .*type:video' |
+      $BB sed -n 's/.* pkt_pts_time:\([0-9.]*\) .*/\1/p' | $BB sort -n | $BB awk '{p[NR]=$1} END{ if(NR<60) exit;
+      d=(p[NR-10]-p[11])/(NR-21); n=split("1001/24000 1/24 1/25 1001/30000 1/30 1/50 1001/60000 1/60",c," ");
+      be=1; for(i=1;i<=n;i++){ split(c[i],q,"/"); f=q[1]/q[2]; e=(d-f)/f; if(e<0)e=-e; if(e<be){be=e; bc=c[i]} } if(be<0.005) print bc }')
+    [ -n "$FS" ] && echo "ub820run: matroska: measured frame period $FS s" >&2; fi
+  if [ -n "$FS" ]; then
+    # ffmpeg 7.1's matroska path gives B-frames DTS == PTS and its non-monotonic-DTS fix-up then mangles their PTS
+    # (groups of frames 1 tick apart -> judder; 2026-11-28 capture). Rebuild DTS = first PTS + (N - 3) frames in the
+    # demuxer's own (1 ms) time base: monotonic, <= PTS with 3 frames of reorder headroom; PTS left untouched.
+    VOPT="-c:v copy -bsf:v 'setts=dts=round((STARTPTS*TB+(N-3)*($FS))/TB)'"
+    echo "ub820run: matroska: rebuilding video DTS on the $FS s frame grid" >&2
+    # (old experiment, UB820_SNAP=2: second copy-only ffmpeg snapping PTS too; it made things worse)
+    if [ "${UB820_SNAP:-1}" = 2 ]; then SID="-streamid 0:4113"; i=0; while [ $i -lt "${AN:-0}" ] && [ "$AT" != none ]; do SID="$SID -streamid $((i+1)):$((4352+i))"; i=$((i+1)); done
+      SNAP=" | $FFX -hide_banner -loglevel error -nostdin -i - -map 0 -c copy -bsf:v 'setts=pts=round(round(PTS*TB/($FS))*($FS)/TB):dts=round((round(STARTPTS*TB/($FS))+N-3)*($FS)/TB)' $SID -f mpegts -mpegts_flags +resend_headers -pcr_period 20 -"; fi
+  fi
+fi
 # ---- subtitles: pick a source -> SUBFILE (an .srt/.vtt subovl reads; it re-reads it while the extractor grows it)
 SRT=/tmp/ub820.srt; SUBFILE=""; SUBX=""; SUBPID=""; EXPID=""; SUBKEY=""
 : > /tmp/ub820run.subtracks
@@ -112,11 +159,17 @@ case "$ST" in ''|*[!0-9]*) ;; *)
     fi
   fi;;
 esac
-if [ -n "$SUBFILE" ] && [ "$MODE" = --4k ] && [ -z "${UB820_SUBS_4K:-}" ]; then
+if [ -n "$SUBFILE" ] && [ "$MODE" = --4k ] && [ "${UB820_SUBS_4K:-1}" = 0 ]; then   # 4K route now default for all; overlay draws there (2026-11-28)
   echo "ub820run: subtitles are not supported in 4K mode yet (plane 7 untested there; UB820_SUBS_4K=1 to try)" >&2; SUBFILE=""; SUBX=""; fi
 if [ -n "$SUBFILE" ] && [ ! -x $BIN/subovl ]; then echo "ub820run: $BIN/subovl missing: no subtitles" >&2; SUBFILE=""; SUBX=""; fi
-echo "ub820run: video=$VC ${W}x${H} -> $CODEC ($( [ "$VOPT" = "-c:v copy" ] && echo copy || echo transcode)), audio[$AT]=${AC:-none} -> ${ACODEC:-none}, $MODE" >&2
-CMD="$FF -hide_banner -loglevel error -nostdin $SSO $RAWIN -i \"$F\" -map 0:v:0 $VOPT $AOPT -f mpegts -mpegts_flags +resend_headers -streamid 0:4113 -pcr_period 20 -"
+echo "ub820run: video=$VC ${W}x${H} -> $CODEC ($( [ "${VOPT#-c:v copy}" != "$VOPT" ] && echo copy || echo transcode)), audio[$AT]=${AC:-none} -> ${ACODEC:-none}, $MODE" >&2
+# Pin the streaming ffmpeg to CPU 2 when video is copied (software video transcodes need all cores): with ffmpeg free to run on the cores
+# vcavsrv's decoder threads use, live audio transcoding made the video stall ~0.3 s every ~5 s (2026-11-28; nice and
+# SCHED_IDLE did not help, pinning did: 0 dips in 60 s). UB820_FFRUN overrides the runlow options ("" = no pinning).
+FFR=${UB820_FFRUN-$( [ "${VOPT#-c:v copy}" != "$VOPT" ] && echo "-c 0x4")}   # transcode: all cores (pinned it fell behind)
+[ -n "$FFR" ] && [ -x $BIN/runlow ] && FFX="$BIN/runlow $FFR $FF"
+CMD="$FFX -hide_banner -loglevel error -nostdin $SSO $RAWIN $DECOPT -i \"$F\" -map 0:v:0 $VOPT $AOPT -f mpegts -mpegts_flags +resend_headers -streamid 0:4113 -pcr_period 20 -$SNAP"
+[ -n "${UB820_TEE:-}" ] && CMD="$CMD | $BB head -c ${UB820_TEEMAX:-120000000} | $BB tee $UB820_TEE"   # test knob: capture what ub820play gets
 if [ -n "${UB820_DRY:-}" ]; then echo "$CMD | $PL --codec $CODEC $MODE $APL -"
   [ -n "$SUBX" ] && echo "$SUBX &"; [ -n "$SUBFILE" ] && echo "$BIN/subovl \"$SUBFILE\" ${UB820_SUBOPT:-} &"; exit 0; fi
 start_subs(){ [ -n "$SUBFILE" ] || return 0
@@ -125,7 +178,14 @@ stop_subs(){ [ -n "$SUBPID" ] || return 0; kill "$SUBPID" 2>/dev/null; wait "$SU
 stop_extract(){ [ -n "$EXPID" ] || return 0
   if kill -0 "$EXPID" 2>/dev/null; then kill "$EXPID" 2>/dev/null; wait "$EXPID" 2>/dev/null   # incomplete: no cache key
   elif wait "$EXPID" 2>/dev/null; then echo "$SUBKEY" > $SRT.key; fi; EXPID=""; }
-cleanup(){ stop_subs; stop_extract; [ "${USE_LL:-0}" = 1 ] && $BB umount /usr/local/bin/vcavsrv 2>/dev/null; }
+# ---- ub820keys BEGIN: remote-control daemon (IR/CEC/LAN keys -> ub820play ctl; findings/remote-keys.md) ----
+# Runs for the whole playback (all renewal sessions); stopped before homerestore and on any exit. UB820_KEYS=0 = off.
+KEYPID=""
+start_keys(){ [ "${UB820_KEYS:-1}" != 0 ] && [ -x $BIN/ub820keys ] || return 0
+  $BIN/ub820keys --log /tmp/ub820keys.log < /dev/null > /dev/null 2>&1 & KEYPID=$!; }
+stop_keys(){ [ -n "$KEYPID" ] || return 0; kill "$KEYPID" 2>/dev/null; wait "$KEYPID" 2>/dev/null; KEYPID=""; }
+# ---- ub820keys END ----
+cleanup(){ stop_keys; stop_subs; stop_extract; [ "${USE_LL:-0}" = 1 ] && $BB umount /usr/local/bin/vcavsrv 2>/dev/null; }   # ub820keys: +stop_keys
 trap cleanup EXIT
 trap 'exit 143' TERM INT HUP
 # one overlay at a time: stop leftovers from an earlier run (SIGTERM; they clear LOSD0 on the way out)
@@ -139,16 +199,20 @@ if [ -n "$SUBX" ]; then $BB rm -f $SRT $SRT.key; eval "exec $SUBX" < /dev/null &
 # the limit with rc 12 and records its position; restart from there (a few seconds' gap, home routing restored between).
 # Experimental lossless passthrough: bind-mount the patched vcavsrv for this playback only (RAM; undone on exit/reboot)
 if [ "${USE_LL:-0}" = 1 ]; then
-  $BB grep -q ' /usr/local/bin/vcavsrv ' /proc/mounts || $BB mount --bind $BIN/vcavsrv.lossless /usr/local/bin/vcavsrv
+  $BB grep -q ' /usr/local/bin/vcavsrv ' /proc/mounts || $BB mount --bind ${UB820_LLBIN:-$BIN/vcavsrv.lossless} /usr/local/bin/vcavsrv
   echo "ub820run: LOSSLESS passthrough (patched vcavsrv bound)" >&2
   # (unmounted by cleanup() on exit)
 fi
 BASE=${SS:-0}; N=0
+$BB rm -f /tmp/ub820run.nohome
 printf '%s\n%s\n%s\n' "$F" "$AT" "$STARG" > /tmp/ub820run.cur
+# duration (s) for the web remote's progress bar and seek clamp
+echo "$INFO" | $BB sed -n 's/.*Duration: \([0-9]*\):\([0-9]*\):\([0-9.]*\),.*/\1 \2 \3/p' | $BB head -1 | $BB awk '{printf "%.1f\n", $1*3600+$2*60+$3}' > /tmp/ub820run.dur
+start_keys                        # ub820keys: remote control on
 while :; do
   echo "$BASE" > /tmp/ub820run.base
   start_subs                      # one overlay per player session: it exits/clears when this session's player is done
-  eval "$CMD" | $PL --codec $CODEC $MODE $APL -
+  eval "$CMD" | $PL --codec $CODEC $MODE $APL ${UB820_PLAYOPT:-} -
   RC=$?; N=$((N+1))
   stop_subs
   echo "ub820run: player exit $RC (session $N)" >&2
@@ -157,9 +221,12 @@ while :; do
   [ -n "$POS" ] || break
   BASE=$($BB awk -v b="$BASE" -v p="$POS" 'BEGIN{printf "%.3f", b+p}')
   echo "ub820run: renewing session at ${BASE}s" >&2
-  CMD="$FF -hide_banner -loglevel error -nostdin -ss $BASE $RAWIN -i \"$F\" -map 0:v:0 $VOPT $AOPT -f mpegts -mpegts_flags +resend_headers -streamid 0:4113 -pcr_period 20 -"
+  CMD="$FFX -hide_banner -loglevel error -nostdin -ss $BASE $RAWIN $DECOPT -i \"$F\" -map 0:v:0 $VOPT $AOPT -f mpegts -mpegts_flags +resend_headers -streamid 0:4113 -pcr_period 20 -$SNAP"
   [ "$MODE" = --hd ] && [ -x $BIN/flipclear ] && $BIN/flipclear >/dev/null 2>&1
 done
 # 4K sessions tear the home UI down (4KOTT use case); bring it back: AM "go home" (42004) + ACEMGR ONPLAY.
-[ "$MODE" = --4k ] && [ -x $BIN/homerestore ] && $BIN/homerestore >> /tmp/homerestore.log 2>&1
+stop_keys                         # ub820keys: remote control off before the home screen comes back
+# (skipped when the web remote / ub820keys restarts us at once for a seek: /tmp/ub820run.nohome)
+if [ -f /tmp/ub820run.nohome ]; then $BB rm -f /tmp/ub820run.nohome
+elif [ "$MODE" = --4k ] && [ -x $BIN/homerestore ]; then $BIN/homerestore >> /tmp/homerestore.log 2>&1; fi
 exit $RC

@@ -26,6 +26,7 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -199,12 +200,13 @@ static int parse_acodec(const char* s){             /* name or number 0..255; -1
 /* Limits [C: findings/vcav-ts-40mb.md, vcav-hevc-tiles.md, LOG 2026-11-27 ~22:40 and ~23:25] */
 #define TS_PKT        188
 #define BLOCK_MAX     (4L * 1024 * 1024 / TS_PKT * TS_PKT)    /* 4194280; one write must stay <= ~4.37 MB */
+#define BLOCK_DEF     (1L * 1024 * 1024 / TS_PKT * TS_PKT)    /* 1048476; smaller writes = smoother 4K (2026-11-28 test) */
 #define BLOCK_MIN     (TS_PKT * 512L)
 #define PREBUF_MAX    (2L * 1024 * 1024 / TS_PKT * TS_PKT)    /* before PLAY the type-0 ring takes only a few MB */
 #define RING_EST      (9L * 1024 * 1024)                       /* type-0 rtsc ring, >= ~9.3 MB live [I] */
 #define SESSION_XFERS 300                                      /* FeedDec transfers per vcavsrv session [C live] */
 #define SESSION_WARN  290
-#define PARTIAL_MIN   (1L * 1024 * 1024)                       /* smallest early (starving-input) write */
+#define PARTIAL_MIN   (256L * 1024)                           /* smallest early (starving-input) write */
 
 static int ioc(int fd, unsigned cmd, void* arg, int sz){
     int r = VcAvIoctl_func(fd, cmd, arg, sz, "ub820play", __LINE__);
@@ -251,9 +253,9 @@ static const char USAGE[] =
 "  --lead SECONDS                   PCR lead kept ahead of the display clock (default 3)\n"
 "  --ctl PATH                       control FIFO (default /tmp/ub820play.ctl; \"\" = off)\n"
 "  --status PATH                    status file (default /tmp/ub820play.status; \"\" = off)\n"
-"  --block BYTES                    bytes per write, 96256..4194280 (default 4194280)\n"
+"  --block BYTES                    bytes per write, 96256..4194280 (default 1048476)\n"
 "  --max-writes N                   writes per vcavsrv session (default 300 = the FeedDec limit)\n"
-"  --max-inflight N                 write only while FeedDecs in flight <= N, 0..2 (default 1)\n"
+"  --max-inflight N                 write only while FeedDecs in flight <= N, 0..2 (default 2)\n"
 "  --watchdog SECONDS               kill + home restore if the player is wedged (default 20; 0 = off)\n"
 "  --size WxH  --fps F              VIDEO property size / rate (default 1920x1080, 24)\n"
 "  --quiet | -v                     warnings and errors only | debug log\n";
@@ -266,10 +268,10 @@ static int parse_num(const char* s, long* out){
 static int parse_args(int argc, char** argv){
     O.codec = -1; O.vpid = -1; O.pcrpid = -1; O.apid = -1; O.acodec = -1; O.afs = 48000; O.lead = 3.0;
     O.ctl = "/tmp/ub820play.ctl"; O.status = "/tmp/ub820play.status";
-    O.block = BLOCK_MAX; O.max_writes = 2147483647;   /* unlimited: draining the server's per-transfer events
+    O.block = BLOCK_DEF; O.max_writes = 2147483647;   /* unlimited: draining the server's per-transfer events
                                                               * (drain_events) removes the old 300-transfer stall;
                                                               * UB820_DRAIN=0 restores the 300 cap */
-    if(getenv("UB820_DRAIN") && !atoi(getenv("UB820_DRAIN"))) O.max_writes = SESSION_XFERS; O.max_inflight = 1; O.watchdog = 20;
+    if(getenv("UB820_DRAIN") && !atoi(getenv("UB820_DRAIN"))) O.max_writes = SESSION_XFERS; O.max_inflight = 2; O.watchdog = 20;
     O.width = 1920; O.height = 1080; O.fps1000 = 24000;
     for(int i = 1; i < argc; i++){
         const char* a = argv[i];
@@ -352,10 +354,13 @@ static void signals_setup(void){
 /* ======================================================================================================== */
 /* MPEG-TS input: 188-byte packets, resync on a lost 0x47, PCR / PTS / PSI tracking                         */
 /* ======================================================================================================== */
-#define RBUF_CAP (256 * 1024)
+/* Read-ahead buffer. Large (default 24 MiB, UB820_RBUF=MiB) so the producer (ffmpeg) runs ahead of the decoder and its
+ * periodic ~0.5 s output gaps (live audio transcode, 2026-11-28) never reach the feed. Ring-less: data lives at
+ * r[ro .. ro+rlen), compacted when ro passes half the buffer. */
+static long RBUF_CAP = 24L * 1024 * 1024;
 static struct {
     int fd, eof, is_stdin;
-    uint8_t* r; long rlen;                /* raw read buffer */
+    uint8_t* r; long rlen, ro;            /* raw read buffer: valid bytes at r[ro .. ro+rlen) */
     int synced, m2ts_checked;
     long long in_pos;                     /* input bytes moved out of the read buffer (packets + skipped) */
     long long skipped; long resyncs;
@@ -473,14 +478,14 @@ static int packetize(long cap){
     long i = 0;
     if(!IN.m2ts_checked && IN.rlen >= 2 * 192 + 8){
         IN.m2ts_checked = 1;
-        const uint8_t* r = IN.r;
+        const uint8_t* r = IN.r + IN.ro;
         if(r[0] != 0x47 && r[4] == 0x47 && r[196] == 0x47 && r[388] == 0x47){
             LOG1(LV_ERR, "input looks like 192-byte M2TS/TTS packets; remux to plain 188-byte MPEG-TS (-f mpegts)");
             return -1;
         }
     }
     while(IN.rlen - i >= TS_PKT && BLK.len + TS_PKT <= cap){
-        const uint8_t* q = IN.r + i;
+        const uint8_t* q = IN.r + IN.ro + i;
         if(q[0] == 0x47){
             if(!IN.synced){                                       /* lock only on two sync bytes in a row */
                 if(IN.rlen - i < 2 * TS_PKT && !IN.eof) break;    /* need more data to confirm */
@@ -498,7 +503,9 @@ static int packetize(long cap){
             i++; IN.skipped++;
         }
     }
-    if(i){ memmove(IN.r, IN.r + i, (size_t)(IN.rlen - i)); IN.rlen -= i; IN.in_pos += i; }
+    if(i){ IN.ro += i; IN.rlen -= i; IN.in_pos += i;
+           if(IN.rlen == 0) IN.ro = 0;
+           else if(IN.ro > RBUF_CAP / 2 || IN.rlen < 4096){ memmove(IN.r, IN.r + IN.ro, (size_t)IN.rlen); IN.ro = 0; } }
     if(IN.eof && IN.rlen > 0 && IN.rlen < TS_PKT){             /* trailing partial packet */
         lo("dropping "); lo_i(IN.rlen); lo(" trailing bytes (partial TS packet)"); lend(LV_WARN);
         IN.in_pos += IN.rlen; IN.rlen = 0;
@@ -508,7 +515,9 @@ static int packetize(long cap){
 /* One read() into the read buffer (the caller made sure the fd is readable or regular). */
 static int input_read(void){
     if(IN.eof || IN.rlen >= RBUF_CAP) return 0;
-    ssize_t r = read(IN.fd, IN.r + IN.rlen, (size_t)(RBUF_CAP - IN.rlen));
+    if(IN.ro + IN.rlen >= RBUF_CAP){ memmove(IN.r, IN.r + IN.ro, (size_t)IN.rlen); IN.ro = 0; }
+    long room = RBUF_CAP - IN.ro - IN.rlen; if(room > 1024 * 1024) room = 1024 * 1024;
+    ssize_t r = read(IN.fd, IN.r + IN.ro + IN.rlen, (size_t)room);
     if(r < 0){
         if(errno == EINTR || errno == EAGAIN) return 0;
         lo("input read error: "); lo(strerror(errno)); lo(" (treated as end of input)"); lend(LV_ERR);
@@ -530,7 +539,11 @@ static void ctl_open(void){
     if(!O.ctl || !*O.ctl) return;
     struct stat st;
     if(stat(O.ctl, &st) == 0){
-        if(!S_ISFIFO(st.st_mode)){ lo(O.ctl); lo(" exists and is not a FIFO: control disabled"); lend(LV_WARN); return; }
+        if(S_ISREG(st.st_mode) && unlink(O.ctl) == 0){        /* e.g. "echo stop > ctl" with no player running */
+            lo(O.ctl); lo(" was a regular file: replaced by the control FIFO"); lend(LV_WARN);
+            if(mkfifo(O.ctl, 0666) == 0) g_ctl_created = 1;
+            else { lo("mkfifo "); lo(O.ctl); lo(": "); lo(strerror(errno)); lo(": control disabled"); lend(LV_WARN); return; }
+        } else if(!S_ISFIFO(st.st_mode)){ lo(O.ctl); lo(" exists and is not a FIFO: control disabled"); lend(LV_WARN); return; }
     } else if(mkfifo(O.ctl, 0666) == 0) g_ctl_created = 1;
     else { lo("mkfifo "); lo(O.ctl); lo(": "); lo(strerror(errno)); lo(": control disabled"); lend(LV_WARN); return; }
     /* O_RDWR: we are a writer too, so a client closing its end never leaves us at a permanent EOF */
@@ -998,6 +1011,12 @@ static int set_properties(void){
 static void poll_clock(long long now){
     uint32_t et[2] = { 0, 0 };
     if(VcAvIoctl_func(P.s, STREAM_IOCELAPSED, et, 8, "ub820play", __LINE__) < 0) return;
+    {   /* UB820_ELLOG=path: one line per poll "wall_ms elapsed45 et1 writes inflight" (stutter analysis) */
+        static int elfd = -2;
+        if(elfd == -2){ const char* pth = getenv("UB820_ELLOG"); elfd = pth ? open(pth, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0644) : -1; }
+        if(elfd >= 0){ char t[96]; int n = snprintf(t, sizeof t, "%lld %u %ld %ld %d\n", now, et[0], IN.rlen, (long)P.writes, P.inflight);
+                       if(n > 0) (void)!write(elfd, t, (size_t)n); }
+    }
     if(P.sw_pending){
         if(!et[0] || et[0] == P.sw_old) return;
         P.sw_pending = 0; P.presenting = 1; P.elapsed = et[0]; P.el_change_ms = now;
@@ -1118,7 +1137,8 @@ int main(int argc, char** argv){
     if(!strcmp(O.input, "-")){ IN.fd = 0; IN.is_stdin = 1; }
     else { IN.fd = open(O.input, O_RDONLY | O_CLOEXEC);
            if(IN.fd < 0){ lo("open "); lo(O.input); lo(": "); lo(strerror(errno)); lend(LV_ERR); return RC_INPUT; } }
-    IN.r = malloc(RBUF_CAP); BLK.cap = O.block; BLK.b = malloc((size_t)BLOCK_MAX);
+    if(getenv("UB820_RBUF")){ long mb = atol(getenv("UB820_RBUF")); if(mb >= 1 && mb <= 128) RBUF_CAP = mb * 1024 * 1024; else if(mb == 0) RBUF_CAP = 256 * 1024; }
+    IN.r = malloc((size_t)RBUF_CAP); BLK.cap = O.block; BLK.b = malloc((size_t)BLOCK_MAX);
     if(!IN.r || !BLK.b){ LOG1(LV_ERR, "out of memory"); return RC_INPUT; }
     P.state = ST_PREBUF;
     TS.track = 0;
@@ -1128,6 +1148,15 @@ int main(int argc, char** argv){
     }
     if(g_sig){ lo("signal "); lo_i(g_sig); lo(" before playback: nothing to clean up"); lend(LV_INFO); return RC_SIGNAL + g_sig; }
     if(BLK.len == 0){ LOG1(LV_ERR, "no MPEG-TS packets in the input"); return RC_INPUT; }
+    {   /* read ahead before PLAY (still before touching the device): right after PLAY the decoder drains the ring
+         * faster than a just-started ffmpeg delivers, and the lead fell to ~0 (start-up stutter, 2026-11-28).
+         * Default 8 MiB or 4 s, whichever first; UB820_PREREAD=MiB (0 = off). */
+        long pre = 8L * 1024 * 1024; const char* e = getenv("UB820_PREREAD"); if(e) pre = atol(e) * 1024L * 1024;
+        if(pre > RBUF_CAP - 1024 * 1024) pre = RBUF_CAP - 1024 * 1024;
+        long long t0 = now_ms();
+        while(!g_sig && pre > 0 && !IN.eof && IN.rlen < pre && now_ms() - t0 < 4000) wait_events(1, 100);
+        lo("read-ahead before PLAY: "); lo_i(IN.rlen); lo(" bytes in "); lo_i(now_ms() - t0); lo(" ms"); lend(LV_INFO);
+    }
 
     /* ---- PIDs and codec: CLI, else PMT, else defaults ---- */
     if(TS.pmt_seen){
@@ -1281,7 +1310,8 @@ int main(int argc, char** argv){
                     LOG1(LV_ERR, "end of input but the decoder never presented a picture"); P.rc = RC_HALT; P.reason = "no-picture"; break; }
             }
             if(now - last_status >= 1000 || P.want_status){ status_write(); last_status = now; P.want_status = 0; }
-            if(now - last_log >= 5000){
+            static long long logint = -1; if(logint < 0){ const char* li = getenv("UB820_LOGINT"); logint = li ? atoll(li) : 5000; if(logint < 200) logint = 200; }
+            if(now - last_log >= logint){
                 last_log = now;
                 lo(g_state_name[P.state]); if(P.paused) lo("(paused)"); lo(": elapsed "); lo_t(P.elapsed); lo(" s, lead ");
                 if(P.wpcr_valid) lo_t(lead45()); else lo("?"); lo(" s, writes "); lo_i(P.writes); lo(", bytes "); lo_i(P.bytes);
