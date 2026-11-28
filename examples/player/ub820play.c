@@ -266,7 +266,10 @@ static int parse_num(const char* s, long* out){
 static int parse_args(int argc, char** argv){
     O.codec = -1; O.vpid = -1; O.pcrpid = -1; O.apid = -1; O.acodec = -1; O.afs = 48000; O.lead = 3.0;
     O.ctl = "/tmp/ub820play.ctl"; O.status = "/tmp/ub820play.status";
-    O.block = BLOCK_MAX; O.max_writes = SESSION_XFERS; O.max_inflight = 1; O.watchdog = 20;
+    O.block = BLOCK_MAX; O.max_writes = 2147483647;   /* unlimited: draining the server's per-transfer events
+                                                              * (drain_events) removes the old 300-transfer stall;
+                                                              * UB820_DRAIN=0 restores the 300 cap */
+    if(getenv("UB820_DRAIN") && !atoi(getenv("UB820_DRAIN"))) O.max_writes = SESSION_XFERS; O.max_inflight = 1; O.watchdog = 20;
     O.width = 1920; O.height = 1080; O.fps1000 = 24000;
     for(int i = 1; i < argc; i++){
         const char* a = argv[i];
@@ -1012,7 +1015,32 @@ static int query_inflight(void){
     P.inflight = (int)fq[1];
     return P.inflight;
 }
+/* EXPERIMENT (UB820_DRAIN=1): vcavsrv may push unsolicited event bytes onto the client sockets (libvcavif reads some
+ * "client-local" ioctls straight from the fd). If nobody reads them, the socket buffer fills and the server's next
+ * send blocks -> its stream thread stalls (candidate cause of the 300-transfer limit). Between our synchronous
+ * requests any readable bytes are events, so drain them (and log a sample). */
+static long g_drained[3];
+static void drain_events(void){
+    static int on = -1; if(on < 0) on = getenv("UB820_DRAIN") ? (atoi(getenv("UB820_DRAIN")) ? 1 : 0) : 1;   /* default ON */
+    if(!on) return;
+    int fds[3] = { P.s, P.v, P.au };
+    for(int k = 0; k < 3; k++){
+        int fd = fds[k]; if(fd < 0) continue;
+        for(;;){
+            int avail = 0; if(ioctl(fd, FIONREAD, &avail) < 0 || avail <= 0) break;
+            unsigned char buf[4096]; int want = avail < (int)sizeof buf ? avail : (int)sizeof buf;
+            ssize_t r = read(fd, buf, (size_t)want); if(r <= 0) break;
+            if(g_drained[k] == 0 || (g_drained[k] < 4096 && g_loglevel <= LV_INFO)){
+                lo("drain fd "); lo_i(fd); lo(k==0?" (stream)":k==1?" (video)":" (audio)"); lo(": "); lo_i((long)r); lo(" bytes:");
+                for(int i = 0; i < r && i < 24; i++){ static const char hx[] = "0123456789abcdef"; char t[4] = { ' ', hx[buf[i]>>4], hx[buf[i]&15], 0 }; lo(t); }
+                lend(LV_INFO); }
+            g_drained[k] += r;
+        }
+    }
+}
+
 static int write_block(void){
+    drain_events();
     hb(STG_FEED);
     int n = (int)BLK.len;
     int r = VcAvWrite(P.s, BLK.b, n);
@@ -1024,7 +1052,7 @@ static int write_block(void){
     if(g_loglevel <= LV_DBG){ lo("write #"); lo_i(P.writes); lo(" "); lo_i(n); lo(" bytes, pcr "); lo_t(P.wpcr);
                               lo(", lead "); lo_t(lead45()); lend(LV_DBG); }
     BLK.len = 0; BLK.pcr_valid = 0;
-    if(P.writes == SESSION_WARN && O.max_writes > SESSION_WARN){
+    if(P.writes == SESSION_WARN && O.max_writes == SESSION_XFERS){
         lo_i(P.writes); lo(" writes: approaching the "); lo_i(SESSION_XFERS);
         lo("-transfer vcavsrv session limit; feeding stops at "); lo_i(O.max_writes); lend(LV_WARN);
     }

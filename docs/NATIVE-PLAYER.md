@@ -16,7 +16,8 @@ USB file → ffmpeg (static, armv7, on the player) → MPEG-TS (PCR, video PID 0
   - vcav codecs: 0 AAC, 1 AC-3, 2 MPEG audio, 8 E-AC-3.
   - Start order: video unmute → video play → audio unmute → audio PLAY → stream PLAY.
   - Switching tracks: audio stop → new property → audio play.
-- **Limit: 300 FeedDec transfers per vcavsrv session** (a kernel-side table that isn't released on this path).
+- **The "300 transfers" wall (solved).** vcavsrv pushes an unsolicited 8-byte event (`06 00 00 00 00 00 00 00`) onto the client's STREAM socket for every transfer. If the client never reads them, the socket buffer fills after ~300, vcavsrv's send blocks and feeding stops; this looks like a 300-picture / ~40 MB limit. The fix: before each write, read whatever is pending (FIONREAD) on the stream, video and audio fds. With that, a 94 Mbps 4K film played 3:37 in one session.
+- (Historical) Before the fix, the workaround was 300 transfers per vcavsrv session
   - Use 4 MiB writes (one write must be ≤ ~4.37 MB): ~1.26 GB per session.
   - Past that, ub820play stops cleanly (rc 12) and the launcher resumes with `ffmpeg -ss`.
 - **Pacing:** keep the PCR written no more than a few seconds ahead of the server's elapsed clock (ioctl 0x4004d610). VcAvWrite retries -ENOSPC forever, so never let it block.
