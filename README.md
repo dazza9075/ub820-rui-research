@@ -70,3 +70,5 @@ Original code here is MIT (see LICENSE). Panasonic trademarks/firmware are not i
 Panasonic's property.
 
 - [docs/NETWORK-SERVICES.md](docs/NETWORK-SERVICES.md) — custom Network Services page + app launch + toggle.
+
+- [docs/NATIVE-PLAYER.md](docs/NATIVE-PLAYER.md) — **a working native media player**: hardware 4K HDR decode via vcavsrv raw-TS, on-device static ffmpeg, audio/subtitles, web + on-screen remote (sources in `examples/player/`)
